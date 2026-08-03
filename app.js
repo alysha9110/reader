@@ -541,24 +541,77 @@ function openReader(s, at) {
   $('r-hint').style.color = '';
 }
 
+var MAX_NODES = 500;
+
+function makePara(b, i) {
+  var p = el('p', 'para' + (b.t === 'h' ? ' h' : b.t === 'q' ? ' q' : ''));
+  renderRich(p, b);
+  p.dataset.i = i;
+  p.onclick = onTapPara;
+  return p;
+}
+
 function renderChunk(from) {
   var s = S.read.src;
   var end = Math.min(s.blocks.length, from + CHUNK);
   var page = $('page');
-  for (var i = from; i < end; i++) {
-    var b = s.blocks[i];
-    var p = el('p', 'para' + (b.t === 'h' ? ' h' : b.t === 'q' ? ' q' : ''));
-    renderRich(p, b);
-    p.dataset.i = i;
-    p.onclick = onTapPara;
-    page.appendChild(p);
-  }
-  refreshMarks();
+  for (var i = from; i < end; i++) page.appendChild(makePara(s.blocks[i], i));
   S.read.end = end;
-  if (end >= s.blocks.length) {
+  if (S.read.start == null || from < S.read.start) S.read.start = from;
+  if (end >= s.blocks.length && !$('fin')) {
     var fin = el('p', 'empty', 'End of book.');
     fin.id = 'fin';
-    if (!$('fin')) page.appendChild(fin);
+    page.appendChild(fin);
+  }
+  trimTop();
+  refreshMarks();
+}
+
+/* Scrolling back needs earlier paragraphs put above what is on screen, and
+   the viewport held still while that happens. Without the compensation the
+   page jumps by the height of everything inserted. */
+function prependChunk() {
+  var s = S.read.src;
+  var from = Math.max(0, S.read.start - CHUNK);
+  if (from >= S.read.start) return false;
+  var page = $('page');
+  var frag = document.createDocumentFragment();
+  for (var i = from; i < S.read.start; i++) frag.appendChild(makePara(s.blocks[i], i));
+  var before = document.body.scrollHeight;
+  page.insertBefore(frag, page.firstChild);
+  window.scrollBy(0, document.body.scrollHeight - before);
+  S.read.start = from;
+  trimBottom();
+  refreshMarks();
+  return true;
+}
+
+/* Keep the DOM bounded on long books. Trimming happens at the far end from
+   where you are reading, so nothing you can see moves. */
+function trimTop() {
+  var page = $('page');
+  while (S.read.end - S.read.start > MAX_NODES && S.read.start < S.read.end - CHUNK) {
+    var before = document.body.scrollHeight;
+    for (var n = 0; n < CHUNK; n++) {
+      var first = page.querySelector('.para');
+      if (!first) break;
+      first.remove();
+    }
+    S.read.start += CHUNK;
+    window.scrollBy(0, document.body.scrollHeight - before);
+  }
+}
+function trimBottom() {
+  var page = $('page');
+  while (S.read.end - S.read.start > MAX_NODES) {
+    for (var n = 0; n < CHUNK; n++) {
+      var ps = page.querySelectorAll('.para');
+      if (!ps.length) break;
+      ps[ps.length - 1].remove();
+    }
+    S.read.end -= CHUNK;
+    var f = $('fin');
+    if (f) f.remove();
   }
 }
 
@@ -1742,6 +1795,7 @@ window.addEventListener('scroll', function () {
   updateReadHead();
   var bottom = document.body.scrollHeight - window.scrollY - window.innerHeight;
   if (bottom < 600 && S.read.end < S.read.src.blocks.length) renderChunk(S.read.end);
+  if (window.scrollY < 400 && S.read.start > 0) prependChunk();
 }, { passive: true });
 
 window.addEventListener('beforeunload', function () {

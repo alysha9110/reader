@@ -1,4 +1,4 @@
-var CACHE = 'reader-v5';
+var CACHE = 'reader-v6';
 var SHELL = [
   './',
   './index.html',
