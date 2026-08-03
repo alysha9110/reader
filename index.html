@@ -15,6 +15,7 @@
   --red:#A32D2D;
   --serif:Georgia,'Iowan Old Style','Palatino Linotype',serif;
   --sans:-apple-system,'Segoe UI',Roboto,sans-serif;
+  --read-size:17px; --read-leading:1.75;
 }
 *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
 html,body{margin:0;padding:0;background:var(--paper);color:var(--ink);
@@ -36,6 +37,11 @@ button.plain{border:none;padding:8px 4px;color:var(--ink-faint);font-size:12px}
 button:disabled{opacity:.35}
 input,textarea,select{font-family:inherit;font-size:15px;width:100%;background:var(--paper);
   color:var(--ink);border:.5px solid var(--ink-ghost);border-radius:10px;padding:10px}
+select{-webkit-appearance:none;appearance:none;padding-right:26px;
+  background-image:linear-gradient(45deg,transparent 50%,currentColor 50%),
+  linear-gradient(135deg,currentColor 50%,transparent 50%);
+  background-position:calc(100% - 14px) 18px,calc(100% - 9px) 18px;
+  background-size:5px 5px,5px 5px;background-repeat:no-repeat}
 textarea{font-family:var(--serif);line-height:1.6;resize:vertical}
 label{font-size:12px;color:var(--ink-faint);display:block;margin-bottom:6px}
 
@@ -61,11 +67,21 @@ label{font-size:12px;color:var(--ink-faint);display:block;margin-bottom:6px}
 .shelfitem{border-top:.5px solid var(--rule);padding:12px 0;cursor:pointer}
 
 #page{padding:18px}
-.para{font-family:var(--serif);font-size:17px;line-height:1.75;color:var(--ink);
-  margin:0 0 18px;padding:6px 8px;border-radius:6px;transition:background .16s,color .16s;cursor:pointer}
-.para.h{font-size:19px;margin-top:26px}
+.para{font-family:var(--serif);font-size:var(--read-size);line-height:var(--read-leading);
+  color:var(--ink);margin:0 0 18px;padding:6px 8px;border-radius:6px;
+  transition:background .16s,color .16s;cursor:pointer}
+.para.h{font-size:calc(var(--read-size) + 2px);margin-top:26px}
 .para.q{border-left:2px solid var(--rule);border-radius:0;color:var(--ink-soft)}
 .para.taken{background:var(--green-bg);color:var(--green-ink)}
+.para.partial{box-shadow:inset 2px 0 0 var(--green)}
+.para em{font-style:italic}
+.para strong,.serif strong{font-weight:600}
+.para sup,.para sub{font-size:.7em}
+.para code,.serif code{font-family:ui-monospace,monospace;font-size:.9em}
+.pribar{position:sticky;bottom:44px;background:var(--paper);border-top:.5px solid var(--rule);
+  padding:8px 18px;display:none;align-items:center;gap:12px;z-index:3}
+.pribar.on{display:flex}
+.pribar .chips{flex:1}
 .readbar{position:sticky;bottom:0;background:var(--paper);border-top:.5px solid var(--rule);
   padding:10px 18px;display:flex;align-items:center;justify-content:space-between}
 .tophead{position:sticky;top:0;background:var(--paper);padding:12px 18px 0;z-index:2}
@@ -74,6 +90,20 @@ label{font-size:12px;color:var(--ink-faint);display:block;margin-bottom:6px}
 .float.on{display:block}
 
 .card{border:.5px solid var(--rule);border-radius:12px;padding:14px;margin-bottom:10px}
+.card.picked{border-color:var(--green);background:var(--green-bg)}
+.box{width:18px;height:18px;border-radius:5px;border:.5px solid var(--ink-ghost);
+  display:inline-flex;align-items:center;justify-content:center;font-size:12px;color:var(--paper)}
+.box.on{background:var(--green);border-color:var(--green)}
+.stats{display:flex;gap:6px;margin-top:14px}
+.stat{flex:1;background:var(--rule);border-radius:10px;padding:9px 4px;text-align:center;cursor:pointer}
+.stat.on{background:var(--ink)}
+.stat.on .n,.stat.on .k{color:var(--paper)}
+.stat .n{display:block;font-size:17px;color:var(--ink)}
+.stat .k{display:block;font-size:10px;color:var(--ink-faint);margin-top:1px}
+.bulkbar{position:sticky;bottom:0;background:var(--paper);border-top:.5px solid var(--rule);
+  padding:10px 0 16px;margin-top:10px;display:none;z-index:5}
+.bulkbar.on{display:block}
+.bulkbar .chips button{padding:9px 0;font-size:13px}
 .note{background:var(--green-bg);border-radius:10px;padding:10px 12px;margin-top:8px}
 .note .t{font-family:var(--serif);font-size:14px;line-height:1.55;color:var(--green-ink)}
 
@@ -100,9 +130,11 @@ mark{background:var(--amber-bg);color:var(--amber-ink);border-radius:3px;padding
   <div class="next gap" id="nextcard"></div>
   <div class="row"><span class="eyebrow">Reading now</span><span class="ghost" id="shelfcount"></span></div>
   <div id="shelf"></div>
-  <div class="rule gap" style="padding-top:14px;display:flex;justify-content:space-between">
-    <button class="plain" id="btn-add">+ Add book</button>
-    <button class="plain" id="btn-archive">Archive</button>
+  <div class="rule gap" style="padding-top:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px">
+    <button class="plain" id="btn-add">+ Book</button>
+    <button class="plain" id="btn-browse">Extracts</button>
+    <button class="plain" id="btn-archive">Books</button>
+    <button class="plain" id="btn-reading">Reading</button>
     <button class="plain" id="btn-export">Export</button>
     <button class="plain" id="btn-settings">Settings</button>
   </div>
@@ -111,10 +143,18 @@ mark{background:var(--amber-bg);color:var(--amber-ink);border-radius:3px;padding
 
 <div id="s-read" class="screen">
   <div class="tophead">
-    <div class="row"><span class="muted" id="r-title"></span><span class="muted" id="r-pos"></span></div>
+    <div class="row">
+      <span class="muted" id="r-title"></span>
+      <span style="display:flex;gap:10px;align-items:center">
+        <button class="plain" id="r-toc">Contents</button>
+        <button class="plain" id="r-font">Aa</button>
+        <span class="muted" id="r-pos"></span>
+      </span>
+    </div>
     <div class="bar"><i id="r-bar"></i></div>
   </div>
   <div id="page"></div>
+  <div class="pribar" id="pribar"></div>
   <div class="readbar">
     <span class="muted" id="r-hint">Tap a paragraph to extract it</span>
     <button class="plain" id="r-done">Done</button>

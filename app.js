@@ -74,6 +74,69 @@ function del(store, id) {
 }
 function saveCfg() { return put('cfg', { k: 'cfg', v: S.cfg }); }
 
+/* ---------- relative priority ----------
+   Priority is a position in one global ordering, not a bucket. The 1-5 chips
+   are an input; what is stored is `rank`, a float in 0..1, and what matters is
+   where you sit relative to everything else. Two hundred items all set to 3
+   would make buckets meaningless; ranking spreads them and keeps the top of
+   the queue the actual top. */
+var BAND = { 1: [0, 0.10], 2: [0.10, 0.30], 3: [0.30, 0.60], 4: [0.60, 0.85], 5: [0.85, 1] };
+
+function ranked(exclude) {
+  return S.items.concat(S.sources).filter(function (o) {
+    return inQueue(o) && (!exclude || o.id !== exclude.id);
+  }).sort(function (a, b) { return (a.rank || 0.5) - (b.rank || 0.5); });
+}
+
+/* Place an item at the top of its band, so a fresh judgement outranks a stale
+   one at the same level. Fractional insertion keeps a real total order. */
+function place(o, bucket) {
+  bucket = Math.max(1, Math.min(5, Math.round(bucket)));
+  var list = ranked(o);
+  var at = Math.floor(BAND[bucket][0] * list.length);
+  var prev = at > 0 ? list[at - 1].rank : 0;
+  var next = at < list.length ? list[at].rank : 1;
+  o.priority = bucket;
+  o.rank = (prev + next) / 2;
+  if (next - prev < 1e-6) renormalise();
+}
+
+/* Repeated insertion in one spot eventually exhausts float precision.
+   Spread everything evenly when gaps get too small. */
+function renormalise() {
+  var list = ranked();
+  list.forEach(function (o, i) {
+    o.rank = (i + 0.5) / list.length;
+    put(o.kind === 'source' ? 'sources' : 'items', o);
+  });
+}
+
+function percentile(o) {
+  var list = ranked();
+  var i = list.indexOf(o);
+  if (i < 0 || !list.length) return null;
+  return Math.max(1, Math.round((i + 1) / list.length * 100));
+}
+function pctLabel(o) {
+  var p = percentile(o);
+  return p == null ? 'p' + Math.round(o.priority) : 'top ' + p + '%';
+}
+
+/* Existing collections have buckets but no ranks. Lay them out once. */
+function migrateRanks() {
+  var need = S.items.concat(S.sources).filter(function (o) { return typeof o.rank !== 'number'; });
+  if (!need.length) return false;
+  var list = S.items.concat(S.sources).sort(function (a, b) {
+    var d = (a.priority || 3) - (b.priority || 3);
+    return d || (a.createdAt || a.addedAt || 0) - (b.createdAt || b.addedAt || 0);
+  });
+  list.forEach(function (o, i) {
+    if (typeof o.rank !== 'number') o.rank = (i + 0.5) / list.length;
+    put(o.kind === 'source' ? 'sources' : 'items', o);
+  });
+  return true;
+}
+
 /* ---------- scheduling ---------- */
 function clampP(p) { return Math.max(1, Math.min(5, p)); }
 function multFor(p) { return MULT[Math.max(1, Math.min(5, Math.round(p)))]; }
@@ -113,12 +176,25 @@ function queue(includeNotDue) {
   S.items.forEach(function (it) {
     if (inQueue(it) && (includeNotDue || it.dueAt <= now)) out.push(it);
   });
+  /* jitter is scaled to rank space: a few percent of shuffle, enough to stop
+     eleven extracts from the same book arriving in a row */
   out.sort(function (a, b) {
-    var d = (a.priority + jitter(a.id)) - (b.priority + jitter(b.id));
-    if (Math.abs(d) > 0.001) return d;
+    var d = ((a.rank || 0.5) + jitter(a.id) * 0.08) - ((b.rank || 0.5) + jitter(b.id) * 0.08);
+    if (Math.abs(d) > 1e-9) return d;
     return a.dueAt - b.dueAt;
   });
   return out;
+}
+
+/* The queue should never be empty while there is something to read.
+   When nothing is due, offer the highest-priority book you have not finished. */
+function nextUp() {
+  var q = queue();
+  if (q.length) return { item: q[0], due: q.length };
+  var books = S.sources.filter(function (s) {
+    return !s.archived && !s.finishedAt && s.position < s.blocks.length;
+  }).sort(function (a, b) { return a.priority - b.priority; });
+  return { item: books[0] || null, due: 0 };
 }
 
 /* When the due pile outgrows what you can clear, spread it out.
@@ -127,14 +203,15 @@ function autoPostpone() {
   var limit = S.cfg.overload || 40;
   var due = queue();
   if (due.length <= limit) return 0;
+  /* Pushed out by rank, so the bottom of the collection absorbs the overload
+     and the top of the queue is untouched. Each pushed item also slides down
+     the ordering a little, which is the pile-up doing its own triage. */
   var excess = due.slice(limit);
-  var dirty = [];
   excess.forEach(function (o, i) {
     o.dueAt = Date.now() + (1 + Math.floor(i / 12)) * DAY;
-    o.priority = clampP(o.priority + 0.1);
-    dirty.push(o);
+    o.rank = Math.min(0.9999, (o.rank || 0.5) + 0.02);
+    put(o.kind === 'source' ? 'sources' : 'items', o);
   });
-  dirty.forEach(function (o) { put(o.kind === 'source' ? 'sources' : 'items', o); });
   return excess.length;
 }
 
@@ -152,6 +229,39 @@ function joinPath(dir, href) {
   });
   return out.join('/');
 }
+/* Inline formatting we keep. Everything else is unwrapped to its text,
+   so nothing arbitrary from an EPUB ever reaches innerHTML. */
+var INLINE = { EM: 'em', I: 'em', STRONG: 'strong', B: 'strong', CITE: 'em',
+  SUP: 'sup', SUB: 'sub', CODE: 'code', SMALL: 'small', U: 'u', MARK: 'mark' };
+
+function inlineHtml(node) {
+  var out = '';
+  var kids = node.childNodes;
+  for (var i = 0; i < kids.length; i++) {
+    var c = kids[i];
+    if (c.nodeType === 3) { out += esc(c.nodeValue); continue; }
+    if (c.nodeType !== 1) continue;
+    var tag = INLINE[c.tagName.toUpperCase()];
+    var inner = inlineHtml(c);
+    out += tag ? '<' + tag + '>' + inner + '</' + tag + '>' : inner;
+  }
+  return out;
+}
+function tidyHtml(h) {
+  return h.replace(/\s+/g, ' ')
+    .replace(/<(em|strong|sup|sub|code|small|u|mark)>\s*<\/\1>/g, '')
+    .trim();
+}
+/* html is stored only when it adds something over the plain text */
+function richOf(node, plain) {
+  var h = tidyHtml(inlineHtml(node));
+  return h === esc(plain) ? null : h;
+}
+function renderRich(node, o) {
+  if (o.h || o.html) node.innerHTML = o.h || o.html;
+  else node.textContent = o.x != null ? o.x : o.text;
+}
+
 function blocksFromHtml(html) {
   var doc = new DOMParser().parseFromString(html, 'text/html');
   ['script', 'style', 'nav'].forEach(function (t) {
@@ -167,9 +277,37 @@ function blocksFromHtml(html) {
     var t = (n.textContent || '').replace(/\s+/g, ' ').trim();
     if (t.length < 2) return;
     var tag = n.tagName.toLowerCase();
-    out.push({ t: /^h[1-6]$/.test(tag) ? 'h' : (tag === 'blockquote' ? 'q' : 'p'), x: t });
+    var b = { t: /^h[1-6]$/.test(tag) ? 'h' : (tag === 'blockquote' ? 'q' : 'p'), x: t };
+    var h = richOf(n, t);
+    if (h) b.h = h;
+    out.push(b);
   });
   return out;
+}
+
+/* Contents comes from the headings we already parsed. An NCX or nav document
+   would give the same chapter names with far more machinery, and books that
+   have neither still get a usable list this way. */
+function buildToc(blocks, starts) {
+  var toc = blocks.map(function (b, i) {
+    return b.t === 'h' ? { i: i, label: b.x.slice(0, 70) } : null;
+  }).filter(Boolean);
+  if (toc.length >= 3 && toc.length <= 400) return toc;
+  return (starts || []).map(function (i, n) {
+    var b = blocks[i];
+    return { i: i, label: b ? b.x.slice(0, 70) : 'Section ' + (n + 1) };
+  }).filter(function (t, n, a) { return n === 0 || t.i !== a[n - 1].i; });
+}
+
+/* html for the current selection, so shortening keeps its italics */
+function selRich(container) {
+  var sel = window.getSelection();
+  if (!sel || sel.isCollapsed) return null;
+  if (!container.contains(sel.anchorNode)) return null;
+  var frag = sel.getRangeAt(0).cloneContents();
+  var plain = sel.toString().replace(/\s+/g, ' ').trim();
+  var h = tidyHtml(inlineHtml(frag));
+  return { text: plain, html: h === esc(plain) ? null : h };
 }
 
 function parseEpub(file) {
@@ -198,19 +336,21 @@ function parseEpub(file) {
           if (m && /xhtml|html|xml/.test(m.type)) order.push(joinPath(dir, m.href));
         });
         var blocks = [];
+        var starts = [];
         var chain = Promise.resolve();
         order.forEach(function (p) {
           chain = chain.then(function () {
             var f = zip.file(p);
             if (!f) return;
             return f.async('string').then(function (h) {
+              starts.push(blocks.length);
               blocksFromHtml(h).forEach(function (b) { blocks.push(b); });
             }).catch(function () {});
           });
         });
         return chain.then(function () {
           if (!blocks.length) throw new Error('No readable text found in that EPUB');
-          return { title: title, author: author, blocks: blocks };
+          return { title: title, author: author, blocks: blocks, toc: buildToc(blocks, starts) };
         });
       });
     });
@@ -235,10 +375,12 @@ function addSource(file) {
   return p.then(function (d) {
     var s = {
       id: uid(), kind: 'source', title: d.title, author: d.author, blocks: d.blocks,
-      position: 0, priority: 3, interval: 0, dueAt: Date.now(), reps: 0,
-      archived: false, addedAt: Date.now(), finishedAt: null
+      toc: d.toc || [], position: 0, priority: 3, rank: 0.5,
+      interval: 0, dueAt: Date.now(), reps: 0,
+      archived: false, addedAt: Date.now(), createdAt: Date.now(), finishedAt: null
     };
     S.sources.push(s);
+    place(s, 3);
     return put('sources', s).then(function () {
       toast(d.title + ' added, ' + plural(d.blocks.length, 'paragraph'));
       home();
@@ -261,18 +403,24 @@ function byId(id) {
   return null;
 }
 
-function makeItem(type, text, source, parentId, blockIdx) {
+function makeItem(type, text, source, parentId, blockIdx, html) {
+  /* Extracts come back the same evening, not tomorrow. A queue that is empty
+     on the day you made everything in it looks broken. */
+  var firstGap = type === 'note' ? 0.75 : 0.25;
   var it = {
     id: uid(), kind: 'item', type: type, sourceId: source ? source.id : null,
-    parentId: parentId || null, text: text, history: [],
+    parentId: parentId || null, text: text, html: html || null, history: [],
     blockIdx: blockIdx == null ? null : blockIdx,
-    priority: source ? source.priority : 3,
-    interval: type === 'note' ? 2 : 0, reps: 0,
-    dueAt: Date.now() + (type === 'note' ? 2 : 1) * DAY,
+    priority: 3, rank: 0.5,
+    interval: 1, reps: 0,
+    dueAt: Date.now() + firstGap * DAY,
     timesShortened: 0, state: 'open', cardType: null, cloze: '', front: '', back: '',
     createdAt: Date.now()
   };
   S.items.push(it);
+  place(it, type === 'note'
+    ? (source ? source.priority : 3)
+    : (S.cfg.defaultPriority || 4));
   put('items', it);
   return it;
 }
@@ -297,6 +445,7 @@ function show(id) {
 /* ---------- home ---------- */
 function home() {
   show('s-home');
+  S.back = null;
   var q = queue();
   var d = new Date();
   $('today').textContent = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()];
@@ -304,23 +453,24 @@ function home() {
 
   var nc = $('nextcard');
   nc.innerHTML = '';
-  if (!q.length) {
+  var up = nextUp();
+  if (!up.item) {
     nc.style.background = 'transparent';
     nc.style.padding = '0 0 8px';
-    var e = el('p', 'empty', S.sources.length ? 'Nothing due. Pick a book below.' : 'Add a book to begin.');
+    var e = el('p', 'empty', S.sources.length ? 'Nothing left to read. Add a book.' : 'Add a book to begin.');
     nc.appendChild(e);
   } else {
     nc.style.background = '';
     nc.style.padding = '';
-    var top = q[0];
+    var top = up.item;
     var head = el('div', 'row');
-    head.appendChild(el('span', 'eyebrow', 'Up next'));
+    head.appendChild(el('span', 'eyebrow', up.due ? 'Up next' : 'Nothing due'));
     var kindLabel = top.kind === 'source' ? (isRevisit(top) ? 'revisit' : 'read') : top.type;
-    head.appendChild(el('span', 'meta', kindLabel + ' · p' + Math.round(top.priority)));
+    head.appendChild(el('span', 'meta', kindLabel + ' · ' + pctLabel(top)));
     nc.appendChild(head);
     var body = el('p', 'body', top.kind === 'source' ? top.title : top.text.slice(0, 150) + (top.text.length > 150 ? '…' : ''));
     nc.appendChild(body);
-    var b = el('button', '', 'Start queue');
+    var b = el('button', '', up.due ? 'Start queue' : 'Keep reading');
     b.onclick = function () { openQ(top); };
     nc.appendChild(b);
     if (q.length > 1) {
@@ -397,11 +547,13 @@ function renderChunk(from) {
   var page = $('page');
   for (var i = from; i < end; i++) {
     var b = s.blocks[i];
-    var p = el('p', 'para' + (b.t === 'h' ? ' h' : b.t === 'q' ? ' q' : ''), b.x);
+    var p = el('p', 'para' + (b.t === 'h' ? ' h' : b.t === 'q' ? ' q' : ''));
+    renderRich(p, b);
     p.dataset.i = i;
     p.onclick = onTapPara;
     page.appendChild(p);
   }
+  refreshMarks();
   S.read.end = end;
   if (end >= s.blocks.length) {
     var fin = el('p', 'empty', 'End of book.');
@@ -411,26 +563,142 @@ function renderChunk(from) {
 }
 
 function onTapPara(e) {
+  if (window.getSelection && !window.getSelection().isCollapsed) return;
   var p = e.currentTarget;
   var i = +p.dataset.i;
   var s = S.read.src;
   if (S.read.taken[i]) {
     removeItem(S.read.taken[i]);
-    delete S.read.taken[i];
-    p.classList.remove('taken');
+    S.read.last = null;
+    hidePriBar();
+    refreshMarks();
   } else {
-    S.read.taken[i] = makeItem('extract', s.blocks[i].x, s, null, i);
-    p.classList.add('taken');
+    var b = s.blocks[i];
+    var it = makeItem('extract', b.x, s, null, i, b.h || null);
+    refreshMarks();
     if (navigator.vibrate) navigator.vibrate(8);
+    showPriBar(it);
   }
-  countHint();
 }
 
 function countHint() {
-  var n = Object.keys(S.read.taken).length;
+  var n = 0;
+  for (var k in S.read.taken) if (S.read.taken[k]) n++;
   var h = $('r-hint');
-  h.textContent = n === 0 ? 'Tap a paragraph to extract it' : plural(n, 'extract') + ' saved';
+  h.textContent = n === 0 ? 'Tap a paragraph to extract it'
+    : plural(n, 'extract') + ' here · tap again to undo';
   h.style.color = n === 0 ? '' : 'var(--green)';
+}
+
+/* Priority right where the extract was made. Cheap to promote something
+   the moment you feel it matters, and invisible when you do not care. */
+function showPriBar(item) {
+  S.read.last = item;
+  var bar = $('pribar');
+  bar.innerHTML = '';
+  bar.appendChild(el('span', 'ghost', 'Priority'));
+  var chips = el('div', 'chips');
+  [1, 2, 3, 4, 5].forEach(function (p) {
+    var b = el('button', Math.round(item.priority) === p ? 'sel' : '', String(p));
+    b.onclick = function (ev) {
+      ev.stopPropagation();
+      place(item, p);
+      save(item);
+      showPriBar(item);
+      toast(pctLabel(item));
+    };
+    chips.appendChild(b);
+  });
+  bar.appendChild(chips);
+  var grow = el('button', '', '+¶');
+  grow.title = 'Add the next paragraph to this extract';
+  grow.onclick = function (ev) { ev.stopPropagation(); growExtract(item); };
+  bar.appendChild(grow);
+  bar.classList.add('on');
+  clearTimeout(showPriBar._t);
+  showPriBar._t = setTimeout(hidePriBar, 6000);
+}
+function hidePriBar() {
+  clearTimeout(showPriBar._t);
+  $('pribar').classList.remove('on');
+}
+
+/* Swallow the next paragraph into this extract. Four taps beats four drags,
+   and on a phone dragging across a paragraph break is genuinely awful. */
+function growExtract(item) {
+  var s = S.read.src;
+  var last = item.lastBlock == null ? item.blockIdx : item.lastBlock;
+  if (last == null) return toast('This extract is not tied to a paragraph');
+  var n = last + 1;
+  if (n >= s.blocks.length) return toast('End of the book');
+  var b = s.blocks[n];
+  var curHtml = item.html || esc(item.text);
+  item.text = item.text + ' ' + b.x;
+  var merged = curHtml + ' ' + (b.h || esc(b.x));
+  item.html = merged === esc(item.text) ? null : merged;
+  item.lastBlock = n;
+  save(item);
+  refreshMarks();
+  showPriBar(item);
+  if (navigator.vibrate) navigator.vibrate(6);
+  var span = n - (item.blockIdx == null ? n : item.blockIdx) + 1;
+  toast(plural(span, 'paragraph') + ' in this extract');
+  var node = $('page').querySelector('.para[data-i="' + n + '"]');
+  if (node) node.scrollIntoView({ block: 'center', behavior: 'smooth' });
+}
+
+/* One place that decides what every visible paragraph looks like */
+function refreshMarks() {
+  if (!S.read) return;
+  var s = S.read.src;
+  var whole = {}, part = {};
+  S.items.forEach(function (it) {
+    if (it.sourceId !== s.id || it.blockIdx == null) return;
+    var to = it.lastBlock == null ? it.blockIdx : it.lastBlock;
+    for (var i = it.blockIdx; i <= to; i++) {
+      var b = s.blocks[i];
+      if (to > it.blockIdx || (b && it.text.indexOf(b.x) !== -1)) whole[i] = it;
+      else part[i] = it;
+    }
+  });
+  S.read.taken = whole;
+  Array.prototype.slice.call($('page').querySelectorAll('.para')).forEach(function (p) {
+    var i = +p.dataset.i;
+    p.classList.toggle('taken', !!whole[i]);
+    p.classList.toggle('partial', !whole[i] && !!part[i]);
+  });
+  countHint();
+}
+
+function tocSheet() {
+  var s = S.read.src;
+  var toc = s.toc || [];
+  if (!toc.length) return toast('No chapters found in this book');
+  sheet(function (w) {
+    w.appendChild(el('h2', '', 'Contents'));
+    var here = 0;
+    toc.forEach(function (t, n) { if (t.i <= s.position) here = n; });
+    var list = el('div', '');
+    list.style.marginTop = '12px';
+    toc.forEach(function (t, n) {
+      var r = el('div', 'shelfitem');
+      var row = el('div', 'row');
+      var lab = el('span', 'serif', t.label);
+      if (n === here) lab.style.color = 'var(--amber)';
+      row.appendChild(lab);
+      row.appendChild(el('span', 'ghost',
+        Math.round(t.i / s.blocks.length * 100) + '%'));
+      r.appendChild(row);
+      r.onclick = function () {
+        closeSheet();
+        s.position = t.i;
+        save(s);
+        openReader(s, t.i);
+      };
+      list.appendChild(r);
+    });
+    w.appendChild(list);
+  });
 }
 
 function firstVisible() {
@@ -460,7 +728,7 @@ function endSession() {
     s.position = Math.min(Math.max(s.position, firstVisible()), s.blocks.length);
     if (s.position >= s.blocks.length && !s.finishedAt) {
       s.finishedAt = Date.now();
-      s.priority = clampP(s.priority + 1);
+      place(s, clampP(s.priority + 1));
       s.interval = 21;
       s.dueAt = Date.now() + 21 * DAY;
       toast('Finished. It will resurface in three weeks.');
@@ -497,14 +765,14 @@ function drawItem() {
   var head = el('div', 'row');
   var pill = el('span', 'pill ' + (it.type === 'note' ? 'cool' : 'warm'), it.type);
   head.appendChild(pill);
-  var close = el('button', 'plain', 'Close');
-  close.onclick = home;
+  var close = el('button', 'plain', S.back ? 'Back' : 'Close');
+  close.onclick = function () { (S.back || home)(); };
   head.appendChild(close);
   root.appendChild(head);
 
   var body = el('p', 'serif');
   body.style.cssText = 'font-size:18px;line-height:1.7;margin:18px 0 10px';
-  body.textContent = it.text;
+  renderRich(body, it);
   body.id = 'itemtext';
   root.appendChild(body);
 
@@ -540,10 +808,11 @@ function drawItem() {
   narrow.style.marginTop = '8px';
   var keep = el('button', '', 'Keep selection');
   keep.onclick = function () {
-    var t = selText(body);
-    if (!t) return toast('Select some text first');
+    var r = selRich(body);
+    if (!r || !r.text) return toast('Select some text first');
     it.history.push(it.text);
-    it.text = t;
+    it.text = r.text;
+    it.html = r.html;
     it.timesShortened++;
     save(it);
     drawItem();
@@ -551,15 +820,16 @@ function drawItem() {
   };
   var split = el('button', '', 'Split off');
   split.onclick = function () {
-    var t = selText(body);
-    if (!t) return toast('Select some text first');
-    var rest = it.text.replace(t, '').replace(/\s+/g, ' ').trim();
+    var r = selRich(body);
+    if (!r || !r.text) return toast('Select some text first');
+    var rest = it.text.replace(r.text, '').replace(/\s+/g, ' ').trim();
     if (!rest) return toast('That is the whole thing, use Keep selection');
-    var child = makeItem('extract', t, src, it.id, it.blockIdx);
+    var child = makeItem('extract', r.text, src, it.id, it.blockIdx, r.html);
     child.priority = it.priority;
     save(child);
     it.history.push(it.text);
     it.text = rest;
+    it.html = null;
     it.timesShortened++;
     save(it);
     drawItem();
@@ -600,10 +870,13 @@ function drawItem() {
   chips.style.marginTop = '8px';
   [1, 2, 3, 4, 5].forEach(function (p) {
     var b = el('button', Math.round(it.priority) === p ? 'sel' : '', String(p));
-    b.onclick = function () { it.priority = p; save(it); drawItem(); };
+    b.onclick = function () { place(it, p); save(it); drawItem(); };
     chips.appendChild(b);
   });
   pr.appendChild(chips);
+  var pl = el('p', 'ghost', pctLabel(it) + ' of everything waiting');
+  pl.style.marginTop = '6px';
+  pr.appendChild(pl);
   root.appendChild(pr);
 
   var acts = el('div', '');
@@ -656,6 +929,7 @@ function drawItem() {
 }
 
 function nextInQueue() {
+  if (S.back) return S.back();
   var q = queue();
   if (!q.length) return home();
   var n = q[0];
@@ -954,11 +1228,97 @@ function exportSheet() {
   });
 }
 
+/* ---------- reading comfort ---------- */
+var THEMES = {
+  paper: { paper: '#FAF7F0', ink: '#2C2C2A', soft: '#5F5E5A', faint: '#888780', ghost: '#B4B2A9', rule: '#EDE7DA' },
+  sepia: { paper: '#F2E6D0', ink: '#3B2F1E', soft: '#6B5B44', faint: '#8C7B62', ghost: '#B6A68C', rule: '#E2D2B6' },
+  dark: { paper: '#1B1A17', ink: '#E9E3D6', soft: '#B6AF9F', faint: '#8C8677', ghost: '#645F54', rule: '#2E2C27' }
+};
+var FONTS = {
+  serif: "Georgia,'Iowan Old Style','Palatino Linotype',serif",
+  sans: "-apple-system,'Segoe UI',Roboto,sans-serif",
+  mono: "ui-monospace,'SF Mono',Menlo,monospace"
+};
+
+function applyTheme() {
+  var c = S.cfg;
+  var t = THEMES[c.theme || 'paper'] || THEMES.paper;
+  var r = document.documentElement.style;
+  r.setProperty('--paper', t.paper);
+  r.setProperty('--ink', t.ink);
+  r.setProperty('--ink-soft', t.soft);
+  r.setProperty('--ink-faint', t.faint);
+  r.setProperty('--ink-ghost', t.ghost);
+  r.setProperty('--rule', t.rule);
+  r.setProperty('--serif', FONTS[c.font || 'serif'] || FONTS.serif);
+  r.setProperty('--read-size', (c.fontSize || 17) + 'px');
+  r.setProperty('--read-leading', String(c.leading || 1.75));
+  var m = document.querySelector('meta[name=theme-color]');
+  if (m) m.setAttribute('content', t.paper);
+}
+
+function readingSheet() {
+  sheet(function (w) {
+    w.appendChild(el('h2', '', 'Reading'));
+    function group(label, opts, key, dflt, fmt) {
+      var l = el('label', '', label);
+      l.style.marginTop = '16px';
+      w.appendChild(l);
+      var row = el('div', 'chips');
+      opts.forEach(function (o) {
+        var b = el('button', (S.cfg[key] || dflt) === o ? 'sel' : '', fmt ? fmt(o) : o);
+        b.onclick = function () {
+          S.cfg[key] = o;
+          saveCfg();
+          applyTheme();
+          Array.prototype.slice.call(row.children).forEach(function (x, i) {
+            x.className = opts[i] === o ? 'sel' : '';
+          });
+        };
+        row.appendChild(b);
+      });
+      w.appendChild(row);
+    }
+    group('Theme', ['paper', 'sepia', 'dark'], 'theme', 'paper');
+    group('Typeface', ['serif', 'sans', 'mono'], 'font', 'serif');
+    group('Size', [15, 17, 19, 21], 'fontSize', 17, function (n) { return n + 'px'; });
+    group('Line height', [1.5, 1.75, 2], 'leading', 1.75, function (n) { return String(n); });
+
+    var prev = el('p', '');
+    prev.style.cssText = 'font-family:var(--serif);font-size:var(--read-size);line-height:var(--read-leading);margin:20px 0 0;color:var(--ink)';
+    prev.textContent = 'Nothing in life is as important as you think it is while you are thinking about it.';
+    w.appendChild(prev);
+
+    var done = el('button', 'solid wide', 'Done');
+    done.style.marginTop = '18px';
+    done.onclick = closeSheet;
+    w.appendChild(done);
+  });
+}
+
 function settingsSheet() {
   sheet(function (w) {
     w.appendChild(el('h2', '', 'Settings'));
     var wrap = el('div', '');
     wrap.style.marginTop = '14px';
+
+    wrap.appendChild(el('label', '', 'Default priority for new extracts'));
+    var dp = el('div', 'chips');
+    var dpv = { v: S.cfg.defaultPriority || 4 };
+    [1, 2, 3, 4, 5].forEach(function (p) {
+      var b = el('button', dpv.v === p ? 'sel' : '', String(p));
+      b.onclick = function () {
+        dpv.v = p;
+        Array.prototype.slice.call(dp.children).forEach(function (x, i) {
+          x.className = (i + 1) === p ? 'sel' : '';
+        });
+      };
+      dp.appendChild(b);
+    });
+    wrap.appendChild(dp);
+    var dph = el('p', 'ghost', '4 leaves room to demote to 5. If everything defaults to the bottom, priority stops telling the queue anything.');
+    dph.style.margin = '6px 0 16px';
+    wrap.appendChild(dph);
 
     wrap.appendChild(el('label', '', 'Queue overload limit'));
     var ov = document.createElement('input');
@@ -1001,6 +1361,7 @@ function settingsSheet() {
     cancel.onclick = closeSheet;
     var ok = el('button', 'solid', 'Save');
     ok.onclick = function () {
+      S.cfg.defaultPriority = dpv.v;
       S.cfg.overload = Math.max(10, Math.min(200, +ov.value || 40));
       S.cfg.ghRepo = repo.value.trim();
       S.cfg.ghToken = tok.value.trim();
@@ -1014,8 +1375,283 @@ function settingsSheet() {
   });
 }
 
+/* ---------- browse extracts ---------- */
+var BR = { q: '', filter: 'open', book: 'all', sort: 'rank', sel: {}, mode: false };
+
+function selCount() { var n = 0; for (var k in BR.sel) if (BR.sel[k]) n++; return n; }
+function clearSel() { BR.sel = {}; BR.mode = false; }
+
+function stats() {
+  var now = Date.now();
+  var st = { due: 0, open: 0, note: 0, card: 0, kept: 0, oldest: 0 };
+  S.items.forEach(function (i) {
+    if (i.type === 'note') st.note++;
+    if (i.state === 'open' && i.type === 'extract') {
+      st.open++;
+      if (i.dueAt <= now) st.due++;
+      st.oldest = Math.max(st.oldest, now - i.createdAt);
+    } else if (i.state === 'open' && i.dueAt <= now) st.due++;
+    if (i.state === 'card') st.card++;
+    if (i.state === 'kept') st.kept++;
+  });
+  return st;
+}
+
+function browseScreen() {
+  show('s-list');
+  $('l-title').textContent = 'Extracts';
+  var b = $('l-body');
+  b.innerHTML = '';
+
+  var st = stats();
+  var strip = el('div', 'stats');
+  [['due', st.due, 'due', 'open'], ['open', st.open, 'open', 'open'],
+   ['note', st.note, 'notes', 'note'], ['card', st.card, 'to export', 'card'],
+   ['kept', st.kept, 'retired', 'kept']].forEach(function (s) {
+    var cell = el('div', 'stat' + (BR.filter === s[3] ? ' on' : ''));
+    cell.appendChild(el('span', 'n', String(s[1])));
+    cell.appendChild(el('span', 'k', s[2]));
+    cell.onclick = function () { BR.filter = s[3]; clearSel(); browseScreen(); };
+    strip.appendChild(cell);
+  });
+  b.appendChild(strip);
+  if (st.oldest > 3 * DAY) {
+    var age = el('p', 'ghost', 'Oldest open extract is ' + plural(days(st.oldest), 'day') + ' old.');
+    age.style.margin = '8px 0 0';
+    b.appendChild(age);
+  }
+
+  var search = document.createElement('input');
+  search.placeholder = 'Search extracts and notes';
+  search.value = BR.q;
+  search.style.marginTop = '14px';
+  search.oninput = function () { BR.q = this.value; drawBrowse(); };
+  b.appendChild(search);
+
+  var ctl = el('div', 'row');
+  ctl.style.marginTop = '10px';
+
+  var sortSel = document.createElement('select');
+  [['rank', 'By priority'], ['new', 'Newest first'], ['old', 'Oldest first'],
+   ['due', 'Due soonest'], ['long', 'Longest first']].forEach(function (o) {
+    var op = document.createElement('option');
+    op.value = o[0]; op.textContent = o[1];
+    if (BR.sort === o[0]) op.selected = true;
+    sortSel.appendChild(op);
+  });
+  sortSel.onchange = function () { BR.sort = this.value; drawBrowse(); };
+  ctl.appendChild(sortSel);
+
+  if (S.sources.length > 1) {
+    var bookSel = document.createElement('select');
+    var o0 = document.createElement('option');
+    o0.value = 'all'; o0.textContent = 'All books';
+    bookSel.appendChild(o0);
+    S.sources.forEach(function (s) {
+      var o = document.createElement('option');
+      o.value = s.id;
+      o.textContent = s.title.length > 24 ? s.title.slice(0, 24) + '…' : s.title;
+      if (BR.book === s.id) o.selected = true;
+      bookSel.appendChild(o);
+    });
+    bookSel.onchange = function () { BR.book = this.value; drawBrowse(); };
+    ctl.appendChild(bookSel);
+  }
+  b.appendChild(ctl);
+
+  var selrow = el('div', 'row');
+  selrow.style.margin = '12px 0 0';
+  var cnt = el('span', 'ghost', '');
+  cnt.id = 'browsecount';
+  selrow.appendChild(cnt);
+  var selbtn = el('button', 'plain', BR.mode ? 'Cancel' : 'Select');
+  selbtn.onclick = function () {
+    if (BR.mode) clearSel(); else BR.mode = true;
+    browseScreen();
+  };
+  selrow.appendChild(selbtn);
+  b.appendChild(selrow);
+
+  var list = el('div', '');
+  list.id = 'browselist';
+  list.style.marginTop = '10px';
+  b.appendChild(list);
+
+  var bar = el('div', 'bulkbar');
+  bar.id = 'bulkbar';
+  b.appendChild(bar);
+
+  drawBrowse();
+}
+
+function browseMatches() {
+  var q = BR.q.trim().toLowerCase();
+  var rows = S.items.filter(function (i) {
+    if (BR.book !== 'all' && i.sourceId !== BR.book) return false;
+    if (BR.filter === 'open' && !(i.state === 'open' && i.type === 'extract')) return false;
+    if (BR.filter === 'note' && i.type !== 'note') return false;
+    if (BR.filter === 'card' && i.state !== 'card' && i.state !== 'exported') return false;
+    if (BR.filter === 'kept' && i.state !== 'kept') return false;
+    if (q && i.text.toLowerCase().indexOf(q) === -1) return false;
+    return true;
+  });
+  var by = {
+    rank: function (a, b) { return (a.rank || 0.5) - (b.rank || 0.5); },
+    new: function (a, b) { return b.createdAt - a.createdAt; },
+    old: function (a, b) { return a.createdAt - b.createdAt; },
+    due: function (a, b) { return a.dueAt - b.dueAt; },
+    long: function (a, b) { return b.text.length - a.text.length; }
+  };
+  return rows.sort(by[BR.sort] || by.rank);
+}
+
+function drawBrowse() {
+  var list = $('browselist');
+  if (!list) return;
+  list.innerHTML = '';
+  var rows = browseMatches();
+  var n = selCount();
+  $('browsecount').textContent = BR.mode && n
+    ? plural(n, 'item') + ' selected'
+    : plural(rows.length, 'item');
+  drawBulkBar(rows);
+
+  if (!rows.length) {
+    list.appendChild(el('p', 'empty', BR.q ? 'Nothing matches.' : 'Nothing here yet.'));
+    return;
+  }
+
+  rows.slice(0, 300).forEach(function (i) {
+    var s = srcOf(i);
+    var c = el('div', 'card' + (BR.sel[i.id] ? ' picked' : ''));
+    c.style.cursor = 'pointer';
+    var top = el('div', 'row');
+    var left = el('span', '');
+    left.style.cssText = 'display:flex;gap:8px;align-items:center';
+    if (BR.mode) {
+      var box = el('span', 'box' + (BR.sel[i.id] ? ' on' : ''), BR.sel[i.id] ? '✓' : '');
+      left.appendChild(box);
+    }
+    left.appendChild(el('span', 'pill ' + (i.type === 'note' ? 'cool' : ''), i.type));
+    top.appendChild(left);
+    var when = i.dueAt > Date.now()
+      ? 'in ' + plural(Math.max(1, days(i.dueAt - Date.now())), 'day')
+      : 'due';
+    top.appendChild(el('span', 'ghost',
+      (i.state === 'open' ? pctLabel(i) : 'p' + Math.round(i.priority))
+      + ' · ' + (i.state === 'open' ? when : i.state)));
+    c.appendChild(top);
+    var t = el('p', 'serif');
+    t.style.cssText = 'font-size:15px;line-height:1.6;margin:8px 0 6px';
+    t.textContent = i.text.length > 220 ? i.text.slice(0, 220) + '…' : i.text;
+    c.appendChild(t);
+    var nn = notesOf(i.id).length;
+    c.appendChild(el('span', 'ghost',
+      (s ? s.title : 'no source') + (nn ? ' · ' + plural(nn, 'note') : '')));
+    c.onclick = function () {
+      if (BR.mode) {
+        BR.sel[i.id] = !BR.sel[i.id];
+        drawBrowse();
+      } else {
+        S.back = browseScreen;
+        openItem(i);
+      }
+    };
+    /* long-press anywhere gets you into selection mode without hunting for a button */
+    var timer;
+    c.addEventListener('touchstart', function () {
+      timer = setTimeout(function () {
+        if (!BR.mode) {
+          BR.mode = true;
+          BR.sel[i.id] = true;
+          if (navigator.vibrate) navigator.vibrate(12);
+          browseScreen();
+        }
+      }, 450);
+    }, { passive: true });
+    ['touchend', 'touchmove', 'touchcancel'].forEach(function (e) {
+      c.addEventListener(e, function () { clearTimeout(timer); }, { passive: true });
+    });
+    list.appendChild(c);
+  });
+  if (rows.length > 300) list.appendChild(el('p', 'ghost', 'Showing the first 300.'));
+}
+
+function selectedItems() {
+  return S.items.filter(function (i) { return BR.sel[i.id]; });
+}
+
+function drawBulkBar(rows) {
+  var bar = $('bulkbar');
+  if (!bar) return;
+  bar.innerHTML = '';
+  var n = selCount();
+  bar.classList.toggle('on', BR.mode);
+  if (!BR.mode) return;
+
+  var top = el('div', 'row');
+  var all = el('button', 'plain', n === rows.length ? 'Select none' : 'Select all ' + rows.length);
+  all.onclick = function () {
+    if (n === rows.length) BR.sel = {};
+    else rows.forEach(function (i) { BR.sel[i.id] = true; });
+    drawBrowse();
+  };
+  top.appendChild(all);
+  top.appendChild(el('span', 'ghost', n ? plural(n, 'item') : 'nothing selected'));
+  bar.appendChild(top);
+
+  var pri = el('div', 'chips');
+  pri.style.marginTop = '8px';
+  [1, 2, 3, 4, 5].forEach(function (p) {
+    var b = el('button', '', String(p));
+    b.disabled = !n;
+    b.onclick = function () {
+      /* reverse so the first item you picked ends up highest inside the band */
+      selectedItems().reverse().forEach(function (i) { place(i, p); save(i); });
+      toast(plural(n, 'item') + ' moved to ' + (p === 1 ? 'the top' : 'priority ' + p));
+      clearSel();
+      browseScreen();
+    };
+    pri.appendChild(b);
+  });
+  bar.appendChild(pri);
+
+  var acts = el('div', 'chips');
+  acts.style.marginTop = '6px';
+  function act(label, fn, danger) {
+    var b = el('button', '', label);
+    b.disabled = !n;
+    if (danger) b.style.color = 'var(--red)';
+    b.onclick = fn;
+    acts.appendChild(b);
+  }
+  act('Later', function () {
+    selectedItems().forEach(function (i) { bump(i); save(i); });
+    toast(plural(n, 'item') + ' pushed back');
+    clearSel(); browseScreen();
+  });
+  act('Much later', function () {
+    selectedItems().forEach(function (i) { bump(i, 2); save(i); });
+    toast(plural(n, 'item') + ' pushed back hard');
+    clearSel(); browseScreen();
+  });
+  act('Retire', function () {
+    selectedItems().forEach(function (i) { i.state = 'kept'; save(i); });
+    toast(plural(n, 'item') + ' retired');
+    clearSel(); browseScreen();
+  });
+  act('Delete', function () {
+    if (!confirm('Delete ' + plural(n, 'item') + '? This cannot be undone.')) return;
+    selectedItems().forEach(removeItem);
+    toast(plural(n, 'item') + ' deleted');
+    clearSel(); browseScreen();
+  }, true);
+  bar.appendChild(acts);
+}
+
 /* ---------- archive / list ---------- */
 function archiveScreen() {
+  S.back = null;
   show('s-list');
   $('l-title').textContent = 'All books';
   var b = $('l-body');
@@ -1073,24 +1709,27 @@ $('file').onchange = function () {
 $('btn-export').onclick = exportSheet;
 $('btn-settings').onclick = settingsSheet;
 $('btn-archive').onclick = archiveScreen;
+$('btn-browse').onclick = function () { BR.q = ''; clearSel(); browseScreen(); };
+$('btn-reading').onclick = readingSheet;
+$('r-font').onclick = readingSheet;
 $('l-back').onclick = home;
-$('r-done').onclick = endSession;
+$('r-done').onclick = function () { hidePriBar(); endSession(); };
 
 $('r-sel').onclick = function () {
-  var t = selText($('page'));
-  if (!t) return;
+  var r = selRich($('page'));
+  if (!r || !r.text) return;
   var sel = window.getSelection();
   var node = sel.anchorNode;
   while (node && !(node.classList && node.classList.contains('para'))) node = node.parentElement;
   var idx = node ? +node.dataset.i : null;
-  makeItem('extract', t, S.read.src, null, idx);
+  var item = makeItem('extract', r.text, S.read.src, null, idx, r.html);
   sel.removeAllRanges();
   $('r-sel').classList.remove('on');
-  S.read.taken['sel' + uid()] = true;
-  countHint();
+  refreshMarks();
   if (navigator.vibrate) navigator.vibrate(8);
-  toast('Selection extracted');
+  showPriBar(item);
 };
+$('r-toc').onclick = tocSheet;
 
 document.addEventListener('selectionchange', function () {
   if (S.view !== 's-read') return;
@@ -1128,6 +1767,8 @@ open().then(function () {
   S.items = r[1].map(function (i) { i.kind = 'item'; return i; });
   var c = r[2].filter(function (x) { return x.k === 'cfg'; })[0];
   S.cfg = c ? c.v : { overload: 40 };
+  applyTheme();
+  migrateRanks();
   var moved = autoPostpone();
   home();
   if (moved) toast(plural(moved, 'item') + ' postponed to keep today manageable');
