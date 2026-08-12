@@ -141,14 +141,27 @@ function migrateRanks() {
 function clampP(p) { return Math.max(1, Math.min(5, p)); }
 function multFor(p) { return MULT[Math.max(1, Math.min(5, Math.round(p)))]; }
 
-function bump(o, factor) {
+/* What the next interval will be, without committing to it. Used to label
+   the buttons, because "Later" meaning 40 days is worth knowing in advance. */
+function nextInterval(o, factor) {
   var m = Math.pow(multFor(o.priority), factor || 1);
   var base = o.interval || 0.7;
   /* max(base+1, ...) so priority 1 still expands. round(1 * 1.3) is 1,
      which would otherwise trap urgent items at a one-day interval forever. */
-  o.interval = Math.max(1, Math.floor(base) + 1, Math.round(base * m));
+  var v = Math.max(1, Math.floor(base) + 1, Math.round(base * m));
+  return Math.min(v, S.cfg.maxInterval || 180);
+}
+
+function bump(o, factor) {
+  o.interval = nextInterval(o, factor);
   o.dueAt = Date.now() + o.interval * DAY;
   o.reps = (o.reps || 0) + 1;
+}
+
+/* The way back. Nothing should be able to drift out of reach permanently. */
+function pullForward(o) {
+  o.interval = Math.max(1, Math.round((o.interval || 2) / 3));
+  o.dueAt = Date.now();
 }
 
 /* stable per-day jitter so ordering does not jump around mid-session */
@@ -234,6 +247,53 @@ function joinPath(dir, href) {
 var INLINE = { EM: 'em', I: 'em', STRONG: 'strong', B: 'strong', CITE: 'em',
   SUP: 'sup', SUB: 'sub', CODE: 'code', SMALL: 'small', U: 'u', MARK: 'mark' };
 
+/* Real EPUBs rarely use <em>. They use <span class="italic"> and put the
+   styling in a stylesheet, so a semantic-only parser sees flat text. This
+   reads the book's own CSS and maps its class names back to meaning. */
+var CSSMAP = {};
+
+function parseCss(text) {
+  var map = {};
+  var rules = String(text).replace(/\/\*[\s\S]*?\*\//g, '');
+  var re = /([^{}]+)\{([^{}]*)\}/g, m;
+  while ((m = re.exec(rules))) {
+    var decl = m[2].toLowerCase();
+    var info = {};
+    if (/font-style\s*:\s*italic|oblique/.test(decl)) info.i = 1;
+    if (/font-weight\s*:\s*(bold|bolder|[6-9]00)/.test(decl)) info.b = 1;
+    var fs = decl.match(/font-size\s*:\s*([\d.]+)\s*(em|rem|%)/);
+    if (fs) {
+      var v = parseFloat(fs[1]);
+      if (fs[2] === '%') v = v / 100;
+      if (v >= 1.15) info.big = 1;
+    }
+    if (/text-align\s*:\s*center/.test(decl)) info.mid = 1;
+    if (/^\s*(display\s*:\s*none|visibility\s*:\s*hidden)/.test(decl.trim())) info.hide = 1;
+    if (!Object.keys(info).length) continue;
+    m[1].split(',').forEach(function (sel) {
+      var cls = sel.match(/\.([A-Za-z0-9_-]+)/g);
+      if (!cls) return;
+      cls.forEach(function (c) {
+        var k = c.slice(1);
+        map[k] = map[k] || {};
+        for (var p in info) map[k][p] = info[p];
+      });
+    });
+  }
+  return map;
+}
+
+function classInfo(node) {
+  var out = {};
+  var cls = (node.getAttribute && node.getAttribute('class')) || '';
+  cls.split(/\s+/).forEach(function (c) {
+    var v = CSSMAP[c];
+    if (!v) return;
+    for (var p in v) out[p] = v[p];
+  });
+  return out;
+}
+
 function inlineHtml(node) {
   var out = '';
   var kids = node.childNodes;
@@ -242,6 +302,15 @@ function inlineHtml(node) {
     if (c.nodeType === 3) { out += esc(c.nodeValue); continue; }
     if (c.nodeType !== 1) continue;
     var tag = INLINE[c.tagName.toUpperCase()];
+    if (!tag) {
+      var ci = classInfo(c);
+      if (ci.hide) continue;
+      if (ci.i) tag = 'em';
+      else if (ci.b) tag = 'strong';
+      var st = (c.getAttribute && c.getAttribute('style') || '').toLowerCase();
+      if (!tag && /font-style\s*:\s*italic/.test(st)) tag = 'em';
+      if (!tag && /font-weight\s*:\s*(bold|[6-9]00)/.test(st)) tag = 'strong';
+    }
     var inner = inlineHtml(c);
     out += tag ? '<' + tag + '>' + inner + '</' + tag + '>' : inner;
   }
@@ -260,24 +329,78 @@ function richOf(node, plain) {
 function renderRich(node, o) {
   if (o.h || o.html) node.innerHTML = o.h || o.html;
   else node.textContent = o.x != null ? o.x : o.text;
+  if (o.marks && o.marks.length) highlight(node, o.marks);
+}
+
+/* Splitting leaves the parent whole and highlights what was taken, the way
+   SuperMemo does. Cutting the text out destroys the context you kept the
+   extract for in the first place. */
+function highlight(node, marks) {
+  marks.slice().sort(function (a, b) { return b.length - a.length; }).forEach(function (m) {
+    if (!m || m.length < 3) return;
+    var walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT, null);
+    var hits = [], t;
+    while ((t = walker.nextNode())) {
+      if (t.parentNode.nodeName === 'MARK') continue;
+      if (t.nodeValue.indexOf(m) !== -1) hits.push(t);
+    }
+    hits.forEach(function (tn) {
+      var idx = tn.nodeValue.indexOf(m);
+      if (idx < 0) return;
+      var after = tn.splitText(idx);
+      after.splitText(m.length);
+      var mk = document.createElement('mark');
+      mk.textContent = after.nodeValue;
+      after.parentNode.replaceChild(mk, after);
+    });
+  });
+}
+
+var HEAD_CLASS = /(^|[-_])(chap|title|head|hd|h[1-6]|sect|part|subtitle)/i;
+var QUOTE_CLASS = /(quot|epigraph|extract|verse|poem|citation|blockq)/i;
+
+/* Blocks are leaves, so a paragraph inside a blockquote is what we keep and
+   the quote-ness has to be inherited from above it. */
+function classify(n) {
+  var tag = n.tagName.toLowerCase();
+  if (/^h[1-6]$/.test(tag)) return 'h';
+  var a = n, depth = 0;
+  while (a && a.tagName && depth++ < 6) {
+    var at = a.tagName.toLowerCase();
+    if (at === 'body') break;
+    if (at === 'blockquote') return 'q';
+    var acls = a.getAttribute('class') || '';
+    if (QUOTE_CLASS.test(acls)) return 'q';
+    if (/^h[1-6]$/.test(at)) return 'h';
+    a = a.parentElement;
+  }
+  var cls = (n.getAttribute('class') || '');
+  if (HEAD_CLASS.test(cls)) return 'h';
+  var ci = classInfo(n);
+  var t = (n.textContent || '').trim();
+  /* A short, centred, oversized line is a chapter heading in every book that
+     never bothered with an <h1>. Length guard keeps centred verse out. */
+  if ((ci.big || (ci.b && ci.mid)) && t.length < 90) return 'h';
+  return 'p';
 }
 
 function blocksFromHtml(html) {
   var doc = new DOMParser().parseFromString(html, 'text/html');
-  ['script', 'style', 'nav'].forEach(function (t) {
+  ['script', 'style', 'nav', 'svg'].forEach(function (t) {
     Array.prototype.slice.call(doc.getElementsByTagName(t)).forEach(function (n) { n.remove(); });
   });
-  var sel = 'h1,h2,h3,h4,h5,h6,p,blockquote,li';
+  /* div is included because plenty of books use it instead of p. The ancestor
+     check below drops any div that merely wraps other blocks. */
+  var sel = 'h1,h2,h3,h4,h5,h6,p,blockquote,li,div';
   var nodes = Array.prototype.slice.call(doc.querySelectorAll(sel));
-  var set = new Set(nodes);
   var out = [];
   nodes.forEach(function (n) {
-    var a = n.parentElement;
-    while (a) { if (set.has(a)) return; a = a.parentElement; }
+    /* keep only leaves: a container that holds other blocks is not itself one */
+    if (n.querySelector(sel)) return;
+    if (classInfo(n).hide) return;
     var t = (n.textContent || '').replace(/\s+/g, ' ').trim();
     if (t.length < 2) return;
-    var tag = n.tagName.toLowerCase();
-    var b = { t: /^h[1-6]$/.test(tag) ? 'h' : (tag === 'blockquote' ? 'q' : 'p'), x: t };
+    var b = { t: classify(n), x: t };
     var h = richOf(n, t);
     if (h) b.h = h;
     out.push(b);
@@ -292,7 +415,7 @@ function buildToc(blocks, starts) {
   var toc = blocks.map(function (b, i) {
     return b.t === 'h' ? { i: i, label: b.x.slice(0, 70) } : null;
   }).filter(Boolean);
-  if (toc.length >= 3 && toc.length <= 400) return toc;
+  if (toc.length >= 2 && toc.length <= 400) return toc;
   return (starts || []).map(function (i, n) {
     var b = blocks[i];
     return { i: i, label: b ? b.x.slice(0, 70) : 'Section ' + (n + 1) };
@@ -337,12 +460,35 @@ function parseEpub(file) {
         });
         var blocks = [];
         var starts = [];
-        var chain = Promise.resolve();
+        /* Load every stylesheet in the book first, so class names mean
+           something by the time we start reading chapters. */
+        CSSMAP = {};
+        var cssFiles = [];
+        for (var id in map) if (/css/.test(map[id].type)) cssFiles.push(joinPath(dir, map[id].href));
+        var chain = Promise.all(cssFiles.map(function (p) {
+          var f = zip.file(p);
+          return f ? f.async('string').then(function (t) {
+            var m = parseCss(t);
+            for (var k in m) {
+              CSSMAP[k] = CSSMAP[k] || {};
+              for (var q in m[k]) CSSMAP[k][q] = m[k][q];
+            }
+          }).catch(function () {}) : null;
+        }));
         order.forEach(function (p) {
           chain = chain.then(function () {
             var f = zip.file(p);
             if (!f) return;
             return f.async('string').then(function (h) {
+              /* inline <style> blocks count too */
+              var st = h.match(/<style[^>]*>([\s\S]*?)<\/style>/gi);
+              if (st) st.forEach(function (s) {
+                var m2 = parseCss(s.replace(/<\/?style[^>]*>/gi, ''));
+                for (var k in m2) {
+                  CSSMAP[k] = CSSMAP[k] || {};
+                  for (var q in m2[k]) CSSMAP[k][q] = m2[k][q];
+                }
+              });
               starts.push(blocks.length);
               blocksFromHtml(h).forEach(function (b) { blocks.push(b); });
             }).catch(function () {});
@@ -875,18 +1021,14 @@ function drawItem() {
   split.onclick = function () {
     var r = selRich(body);
     if (!r || !r.text) return toast('Select some text first');
-    var rest = it.text.replace(r.text, '').replace(/\s+/g, ' ').trim();
-    if (!rest) return toast('That is the whole thing, use Keep selection');
+    if (r.text.length >= it.text.length - 2) return toast('That is the whole thing, use Keep selection');
     var child = makeItem('extract', r.text, src, it.id, it.blockIdx, r.html);
-    child.priority = it.priority;
+    place(child, it.priority);
     save(child);
-    it.history.push(it.text);
-    it.text = rest;
-    it.html = null;
-    it.timesShortened++;
+    it.marks = (it.marks || []).concat([r.text]);
     save(it);
     drawItem();
-    toast('Split into two');
+    toast('Split off, highlighted here');
   };
   narrow.appendChild(keep);
   narrow.appendChild(split);
@@ -948,21 +1090,27 @@ function drawItem() {
 
   var row2 = el('div', 'chips');
   row2.style.marginTop = '10px';
-  var later = el('button', '', 'Later');
+  var soon = el('button', '', 'Sooner');
+  soon.onclick = function () { pullForward(it); save(it); toast('Back in the queue now'); nextInQueue(); };
+  var later = el('button', '', 'Later · ' + nextInterval(it) + 'd');
   later.onclick = function () { bump(it); save(it); toast('Back in ' + plural(it.interval, 'day')); nextInQueue(); };
-  var push = el('button', '', 'Much later');
+  var push = el('button', '', 'Much later · ' + nextInterval(it, 2) + 'd');
   push.onclick = function () { bump(it, 2); save(it); toast('Back in ' + plural(it.interval, 'day')); nextInQueue(); };
+  row2.appendChild(soon);
   row2.appendChild(later);
   row2.appendChild(push);
   acts.appendChild(row2);
 
   var row3 = el('div', 'chips');
   row3.style.marginTop = '10px';
+  var edit = el('button', '', 'Edit');
+  edit.onclick = function () { editSheet(it); };
+  row3.appendChild(edit);
   var keepn = el('button', '', 'Retire');
   keepn.onclick = function () {
     it.state = 'kept';
     save(it);
-    toast('Kept as a note, out of the queue');
+    toast('Out of the queue, still exports');
     nextInQueue();
   };
   var dele = el('button', '', 'Delete');
@@ -1023,6 +1171,44 @@ function noteSheet(parent) {
       closeSheet();
       drawItem();
       toast('Noted');
+    };
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    w.appendChild(row);
+    setTimeout(function () { ta.focus(); }, 60);
+  });
+}
+
+function editSheet(it) {
+  sheet(function (w) {
+    w.appendChild(el('h2', '', 'Edit'));
+    var p = el('p', 'ghost', it.html
+      ? 'Editing turns this into plain text. The original stays under Show original.'
+      : 'The version before your edit stays under Show original.');
+    p.style.margin = '6px 0 12px';
+    w.appendChild(p);
+    var ta = document.createElement('textarea');
+    ta.rows = 8;
+    ta.value = it.text;
+    w.appendChild(ta);
+    var row = el('div', 'chips');
+    row.style.marginTop = '12px';
+    var cancel = el('button', '', 'Cancel');
+    cancel.onclick = closeSheet;
+    var ok = el('button', 'solid', 'Save');
+    ok.onclick = function () {
+      var t = ta.value.replace(/\s+/g, ' ').trim();
+      if (!t) return toast('Cannot be empty');
+      if (t === it.text) return closeSheet();
+      it.history.push(it.text);
+      it.text = t;
+      it.html = null;
+      /* keep only the highlights that still exist in the edited text */
+      if (it.marks) it.marks = it.marks.filter(function (m) { return t.indexOf(m) !== -1; });
+      save(it);
+      closeSheet();
+      drawItem();
+      toast('Edited');
     };
     row.appendChild(cancel);
     row.appendChild(ok);
@@ -1288,10 +1474,26 @@ var THEMES = {
   dark: { paper: '#1B1A17', ink: '#E9E3D6', soft: '#B6AF9F', faint: '#8C8677', ghost: '#645F54', rule: '#2E2C27' }
 };
 var FONTS = {
-  serif: "Georgia,'Iowan Old Style','Palatino Linotype',serif",
-  sans: "-apple-system,'Segoe UI',Roboto,sans-serif",
-  mono: "ui-monospace,'SF Mono',Menlo,monospace"
+  serif: { label: 'Georgia', stack: "Georgia,'Iowan Old Style','Palatino Linotype',serif" },
+  garamond: { label: 'EB Garamond', g: 'EB+Garamond:ital,wght@0,400;0,500;1,400;1,500', stack: "'EB Garamond',Georgia,serif" },
+  literata: { label: 'Literata', g: 'Literata:ital,opsz,wght@0,7..72,400;0,7..72,500;1,7..72,400', stack: "'Literata',Georgia,serif" },
+  bitter: { label: 'Bitter', g: 'Bitter:ital,wght@0,400;0,500;1,400', stack: "'Bitter',Georgia,serif" },
+  lexend: { label: 'Lexend Deca', g: 'Lexend+Deca:wght@400;500', stack: "'Lexend Deca',system-ui,sans-serif" }
 };
+
+/* Only the typeface you pick gets fetched. The service worker caches it on
+   first use, so it is available offline from then on. */
+function loadFont(key) {
+  var f = FONTS[key];
+  if (!f || !f.g) return;
+  var id = 'font-' + key;
+  if (document.getElementById(id)) return;
+  var l = document.createElement('link');
+  l.id = id;
+  l.rel = 'stylesheet';
+  l.href = 'https://fonts.googleapis.com/css2?family=' + f.g + '&display=swap';
+  document.head.appendChild(l);
+}
 
 function applyTheme() {
   var c = S.cfg;
@@ -1303,7 +1505,9 @@ function applyTheme() {
   r.setProperty('--ink-faint', t.faint);
   r.setProperty('--ink-ghost', t.ghost);
   r.setProperty('--rule', t.rule);
-  r.setProperty('--serif', FONTS[c.font || 'serif'] || FONTS.serif);
+  var fk = FONTS[c.font] ? c.font : 'serif';
+  loadFont(fk);
+  r.setProperty('--serif', FONTS[fk].stack);
   r.setProperty('--read-size', (c.fontSize || 17) + 'px');
   r.setProperty('--read-leading', String(c.leading || 1.75));
   var m = document.querySelector('meta[name=theme-color]');
@@ -1333,13 +1537,32 @@ function readingSheet() {
       w.appendChild(row);
     }
     group('Theme', ['paper', 'sepia', 'dark'], 'theme', 'paper');
-    group('Typeface', ['serif', 'sans', 'mono'], 'font', 'serif');
+    var fl = el('label', '', 'Typeface');
+    fl.style.marginTop = '16px';
+    w.appendChild(fl);
+    var frow = el('div', '');
+    frow.style.cssText = 'display:grid;grid-template-columns:1fr 1fr;gap:6px';
+    Object.keys(FONTS).forEach(function (k) {
+      var b = el('button', (S.cfg.font || 'serif') === k ? 'sel' : '', FONTS[k].label);
+      b.style.fontFamily = FONTS[k].stack;
+      b.onclick = function () {
+        S.cfg.font = k;
+        saveCfg();
+        applyTheme();
+        Array.prototype.slice.call(frow.children).forEach(function (x, i) {
+          x.className = Object.keys(FONTS)[i] === k ? 'sel' : '';
+        });
+      };
+      loadFont(k);
+      frow.appendChild(b);
+    });
+    w.appendChild(frow);
     group('Size', [15, 17, 19, 21], 'fontSize', 17, function (n) { return n + 'px'; });
     group('Line height', [1.5, 1.75, 2], 'leading', 1.75, function (n) { return String(n); });
 
     var prev = el('p', '');
     prev.style.cssText = 'font-family:var(--serif);font-size:var(--read-size);line-height:var(--read-leading);margin:20px 0 0;color:var(--ink)';
-    prev.textContent = 'Nothing in life is as important as you think it is while you are thinking about it.';
+    prev.innerHTML = 'Nothing in life is as <em>important</em> as you think it is while you are <strong>thinking</strong> about it.';
     w.appendChild(prev);
 
     var done = el('button', 'solid wide', 'Done');
@@ -1381,6 +1604,14 @@ function settingsSheet() {
     ovh.style.margin = '6px 0 16px';
     wrap.appendChild(ovh);
 
+    wrap.appendChild(el('label', '', 'Longest interval, in days'));
+    var mx = document.createElement('input');
+    mx.type = 'number'; mx.value = S.cfg.maxInterval || 180; mx.min = 14; mx.max = 3650;
+    wrap.appendChild(mx);
+    var mxh = el('p', 'ghost', 'Nothing gets pushed further out than this, however many times you postpone it.');
+    mxh.style.margin = '6px 0 16px';
+    wrap.appendChild(mxh);
+
     wrap.appendChild(el('label', '', 'GitHub repo (owner/name, private)'));
     var repo = document.createElement('input');
     repo.value = S.cfg.ghRepo || '';
@@ -1416,6 +1647,7 @@ function settingsSheet() {
     ok.onclick = function () {
       S.cfg.defaultPriority = dpv.v;
       S.cfg.overload = Math.max(10, Math.min(200, +ov.value || 40));
+      S.cfg.maxInterval = Math.max(14, Math.min(3650, +mx.value || 180));
       S.cfg.ghRepo = repo.value.trim();
       S.cfg.ghToken = tok.value.trim();
       saveCfg();
@@ -1678,6 +1910,11 @@ function drawBulkBar(rows) {
     b.onclick = fn;
     acts.appendChild(b);
   }
+  act('Sooner', function () {
+    selectedItems().forEach(function (i) { pullForward(i); save(i); });
+    toast(plural(n, 'item') + ' pulled forward');
+    clearSel(); browseScreen();
+  });
   act('Later', function () {
     selectedItems().forEach(function (i) { bump(i); save(i); });
     toast(plural(n, 'item') + ' pushed back');
