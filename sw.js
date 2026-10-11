@@ -1,4 +1,4 @@
-var CACHE = 'reader-v7';
+var CACHE = 'reader-v10';
 var SHELL = [
   './',
   './index.html',
@@ -32,10 +32,10 @@ self.addEventListener('activate', function (e) {
 self.addEventListener('fetch', function (e) {
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    caches.match(e.request).then(function (hit) {
+    caches.match(e.request, { ignoreSearch: e.request.mode === 'navigate' }).then(function (hit) {
       if (hit) {
         fetch(e.request).then(function (res) {
-          if (res && res.ok) caches.open(CACHE).then(function (c) { c.put(e.request, res); });
+          if (res && res.ok && !new URL(e.request.url).search) caches.open(CACHE).then(function (c) { c.put(e.request, res); });
         }).catch(function () {});
         return hit;
       }

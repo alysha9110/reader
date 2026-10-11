@@ -144,11 +144,29 @@ function multFor(p) { return MULT[Math.max(1, Math.min(5, Math.round(p)))]; }
 /* What the next interval will be, without committing to it. Used to label
    the buttons, because "Later" meaning 40 days is worth knowing in advance. */
 function nextInterval(o, factor) {
+  if (S.cfg.scheduler === 'beta') return betaInterval(o, factor);
   var m = Math.pow(multFor(o.priority), factor || 1);
   var base = o.interval || 0.7;
   /* max(base+1, ...) so priority 1 still expands. round(1 * 1.3) is 1,
      which would otherwise trap urgent items at a one-day interval forever. */
   var v = Math.max(1, Math.floor(base) + 1, Math.round(base * m));
+  return Math.min(v, S.cfg.maxInterval || 180);
+}
+
+/* Beta scheduler, after Incremental RemNote's saturating curve.
+   Starts at `first` days and creeps toward `max`, never past it:
+     interval = ceil(first + (max - first) * (n - 1) / (n - 1 + 4))
+   where n is the review number. By review 5 it is halfway to max.
+   Big sources that need twenty visits keep coming back; single extracts
+   get breathing room from the first review. Priority sets the order of
+   the queue, not the interval. "Much later" doubles the step, still
+   capped by the longest interval setting. */
+function betaInterval(o, factor) {
+  var first = Math.max(1, S.cfg.betaFirst || 5);
+  var max = Math.max(first, S.cfg.betaMax || 30);
+  var n = (o.reps || 0) + 1;
+  var v = Math.ceil(first + (max - first) * (n - 1) / (n - 1 + 4));
+  if ((factor || 1) > 1) v *= 2;
   return Math.min(v, S.cfg.maxInterval || 180);
 }
 
@@ -174,8 +192,12 @@ function jitter(id) {
 
 /* Finished books stay in the queue. They come back rarely, opened at a random
    stretch, so you can skim for what you missed the first time. */
+function isColl(s) { return s && s.type === 'collection'; }
+function activeBooks() {
+  return S.sources.filter(function (s) { return !s.archived && !isColl(s); });
+}
 function inQueue(o) {
-  if (o.kind === 'source') return !o.archived;
+  if (o.kind === 'source') return !o.archived && !isColl(o);
   return o.state === 'open';
 }
 function isRevisit(s) { return !!s.finishedAt; }
@@ -208,6 +230,45 @@ function nextUp() {
     return !s.archived && !s.finishedAt && s.position < s.blocks.length;
   }).sort(function (a, b) { return a.priority - b.priority; });
   return { item: books[0] || null, due: 0 };
+}
+
+/* ---------- priority shield ----------
+   The share of your collection, counted from the top, that has nothing
+   left due today. Walk the global ordering from rank 0 down; the first
+   item due by midnight is where protection stops. Shield 30% means
+   everything in your top 30% is handled for today. Midnight rather than
+   "now" keeps the number from wobbling as items tick over during the day. */
+function endOfToday() {
+  var d = new Date();
+  d.setHours(23, 59, 59, 999);
+  return d.getTime();
+}
+function dayKey(t) {
+  var d = t ? new Date(t) : new Date();
+  return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2);
+}
+function shield() {
+  var list = ranked();
+  if (!list.length) return null;
+  var cut = endOfToday();
+  for (var i = 0; i < list.length; i++) {
+    if (list[i].dueAt <= cut) {
+      return { pct: Math.round(i / list.length * 100), blocker: list[i], total: list.length };
+    }
+  }
+  return { pct: 100, blocker: null, total: list.length };
+}
+
+/* One value per day, the latest one seen, which ends up being where you
+   finished. Sixty days is plenty for a trend and keeps the config small. */
+function logShield(sh) {
+  if (!sh) return;
+  var log = S.cfg.shieldLog || {};
+  log[dayKey()] = sh.pct;
+  var keys = Object.keys(log).sort();
+  while (keys.length > 60) delete log[keys.shift()];
+  S.cfg.shieldLog = log;
+  saveCfg();
 }
 
 /* When the due pile outgrows what you can clear, spread it out.
@@ -588,6 +649,98 @@ function show(id) {
   window.scrollTo(0, 0);
 }
 
+/* ---------- shield display ---------- */
+function drawShieldRow() {
+  var row = $('shieldrow');
+  if (!row) return;
+  row.innerHTML = '';
+  var sh = shield();
+  if (!sh) { row.style.display = 'none'; return; }
+  row.style.display = '';
+  logShield(sh);
+  var top = el('div', 'row');
+  top.appendChild(el('span', 'eyebrow', 'Shield'));
+  top.appendChild(el('span', 'muted', sh.pct >= 100 ? 'everything clear today'
+    : 'top ' + sh.pct + '% clear'));
+  row.appendChild(top);
+  var bar = el('div', 'bar shieldbar');
+  var fill = el('i');
+  fill.style.width = sh.pct + '%';
+  bar.appendChild(fill);
+  row.appendChild(bar);
+  row.onclick = shieldSheet;
+}
+
+function shieldSheet() {
+  var sh = shield();
+  if (!sh) return;
+  sheet(function (w) {
+    w.appendChild(el('h2', '', 'Priority shield'));
+    var big = el('p', 'serif', sh.pct >= 100 ? 'Everything is clear for today.'
+      : 'Your top ' + sh.pct + '% has nothing left due today.');
+    big.style.cssText = 'font-size:18px;line-height:1.5;margin:12px 0 6px';
+    w.appendChild(big);
+    var ex = el('p', 'ghost', 'Counted down your whole ordering of ' + plural(sh.total, 'item') +
+      '. The first one still due by midnight is where protection stops. Higher is better.');
+    ex.style.lineHeight = '1.5';
+    w.appendChild(ex);
+
+    if (sh.blocker) {
+      var b = sh.blocker;
+      var c = el('div', 'card');
+      c.style.cssText = 'margin-top:16px;cursor:pointer';
+      c.appendChild(el('span', 'eyebrow', 'Holding it at ' + sh.pct + '%'));
+      var t = el('p', 'serif', b.kind === 'source' ? b.title
+        : b.text.slice(0, 160) + (b.text.length > 160 ? '…' : ''));
+      t.style.cssText = 'font-size:15px;line-height:1.55;margin:8px 0 4px';
+      c.appendChild(t);
+      c.appendChild(el('span', 'ghost', (b.kind === 'source' ? 'book' : b.type) + ' · ranked ' +
+        (ranked().indexOf(b) + 1) + ' of ' + sh.total + ' · clear it to raise the shield'));
+      c.onclick = function () { closeSheet(); openQ(b); };
+      w.appendChild(c);
+    }
+
+    var log = S.cfg.shieldLog || {};
+    var keys = Object.keys(log).sort().slice(-30);
+    var lab = el('label', '', 'Last ' + plural(keys.length, 'day'));
+    lab.style.marginTop = '18px';
+    w.appendChild(lab);
+    if (keys.length < 2) {
+      w.appendChild(el('p', 'ghost', 'A trend line appears after a second day of use.'));
+    } else {
+      var W = 300, H = 90, pad = 4;
+      var pts = keys.map(function (k, i) {
+        var x = pad + i * (W - 2 * pad) / (keys.length - 1);
+        var y = pad + (100 - log[k]) / 100 * (H - 2 * pad);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
+      var svg = '<svg viewBox="0 0 ' + W + ' ' + H + '" width="100%" height="' + H +
+        '" role="img" aria-label="Shield over the last ' + keys.length + ' days">' +
+        '<line x1="0" y1="' + (H / 2) + '" x2="' + W + '" y2="' + (H / 2) +
+        '" stroke="var(--rule)" stroke-dasharray="3 3"/>' +
+        '<polyline points="' + pts + '" fill="none" stroke="var(--amber)" stroke-width="2"' +
+        ' stroke-linejoin="round" stroke-linecap="round"/></svg>';
+      var g = el('div', '');
+      g.innerHTML = svg;
+      w.appendChild(g);
+      var axis = el('div', 'row');
+      axis.appendChild(el('span', 'ghost', keys[0].slice(5)));
+      axis.appendChild(el('span', 'ghost', 'dashed line is 50%'));
+      axis.appendChild(el('span', 'ghost', keys[keys.length - 1].slice(5)));
+      w.appendChild(axis);
+    }
+
+    var tip = el('p', 'ghost', 'Sliding down for days means more is coming in than you clear. ' +
+      'Read more, extract less, or demote things that do not deserve their place.');
+    tip.style.cssText = 'margin-top:16px;line-height:1.5';
+    w.appendChild(tip);
+    var done = el('button', 'solid wide', 'Close');
+    done.style.marginTop = '16px';
+    done.onclick = closeSheet;
+    w.appendChild(done);
+  });
+}
+
 /* ---------- home ---------- */
 function home() {
   show('s-home');
@@ -596,6 +749,7 @@ function home() {
   var d = new Date();
   $('today').textContent = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'][d.getDay()];
   $('duecount').textContent = q.length ? q.length + ' due' : 'all clear';
+  drawShieldRow();
 
   var nc = $('nextcard');
   nc.innerHTML = '';
@@ -634,7 +788,7 @@ function home() {
     }
   }
 
-  var active = S.sources.filter(function (s) { return !s.archived; });
+  var active = activeBooks();
   $('shelfcount').textContent = active.length + ' of ' + SHELF_MAX;
   var sh = $('shelf');
   sh.innerHTML = '';
@@ -660,6 +814,17 @@ function home() {
     row.appendChild(el('span', 'ghost',
       (s.author ? s.author + ' · ' : '') + pct + '% · priority ' + Math.round(s.priority)));
     row.onclick = function () { openReader(s); };
+    sh.appendChild(row);
+  });
+  S.sources.filter(function (s) { return isColl(s) && !s.archived; }).forEach(function (s) {
+    var n = S.items.filter(function (i) { return i.sourceId === s.id && i.state === 'open'; }).length;
+    var row = el('div', 'shelfitem');
+    var r1 = el('div', 'row');
+    r1.appendChild(el('span', 'serif', s.title));
+    r1.appendChild(el('span', 'pill', String(n)));
+    row.appendChild(r1);
+    row.appendChild(el('span', 'ghost', 'collection · priority ' + Math.round(s.priority)));
+    row.onclick = function () { BR.q = ''; BR.book = s.id; BR.filter = 'open'; clearSel(); browseScreen(); };
     sh.appendChild(row);
   });
 }
@@ -1120,6 +1285,15 @@ function drawItem() {
   row3.appendChild(dele);
   acts.appendChild(row3);
 
+  if (it.url) {
+    var lk = document.createElement('a');
+    lk.href = it.url;
+    lk.target = '_blank';
+    lk.rel = 'noopener';
+    lk.className = 'plain wide srclink';
+    lk.textContent = 'Open the page ↗';
+    acts.appendChild(lk);
+  }
   if (src && it.blockIdx != null) {
     var ctx = el('button', 'plain wide', 'Show in book');
     ctx.style.marginTop = '12px';
@@ -1604,6 +1778,61 @@ function settingsSheet() {
     ovh.style.margin = '6px 0 16px';
     wrap.appendChild(ovh);
 
+    wrap.appendChild(el('label', '', 'Scheduler'));
+    var sc = el('div', 'chips');
+    var scv = { v: S.cfg.scheduler === 'beta' ? 'beta' : 'priority' };
+    var betaBox = el('div', '');
+    var sch = el('p', 'ghost', '');
+    sch.style.cssText = 'margin:6px 0 12px;line-height:1.5';
+    function scHint() {
+      sch.textContent = scv.v === 'beta'
+        ? 'Starts at your first interval and levels off toward the ceiling, never past it. Priority only sets the order of the queue.'
+        : 'Each priority grows at its own rate: 1 slowly, 5 fast. Priority sets both the order and how soon things come back.';
+      betaBox.style.display = scv.v === 'beta' ? '' : 'none';
+    }
+    [['priority', 'By priority'], ['beta', 'Beta curve']].forEach(function (o) {
+      var b = el('button', scv.v === o[0] ? 'sel' : '', o[1]);
+      b.onclick = function () {
+        scv.v = o[0];
+        Array.prototype.slice.call(sc.children).forEach(function (x) { x.className = ''; });
+        b.className = 'sel';
+        scHint();
+      };
+      sc.appendChild(b);
+    });
+    wrap.appendChild(sc);
+    wrap.appendChild(sch);
+
+    var brow = el('div', 'row');
+    brow.style.alignItems = 'flex-start';
+    var bf = el('div', ''); bf.style.flex = '1';
+    bf.appendChild(el('label', '', 'First interval, days'));
+    var bfi = document.createElement('input');
+    bfi.type = 'number'; bfi.min = 1; bfi.max = 60; bfi.value = S.cfg.betaFirst || 5;
+    bf.appendChild(bfi);
+    var bm = el('div', ''); bm.style.flex = '1';
+    bm.appendChild(el('label', '', 'Ceiling, days'));
+    var bmi = document.createElement('input');
+    bmi.type = 'number'; bmi.min = 2; bmi.max = 365; bmi.value = S.cfg.betaMax || 30;
+    bm.appendChild(bmi);
+    brow.appendChild(bf);
+    brow.appendChild(bm);
+    betaBox.appendChild(brow);
+    var bprev = el('p', 'ghost', '');
+    bprev.style.margin = '6px 0 16px';
+    function preview() {
+      var f = Math.max(1, +bfi.value || 5), m = Math.max(f, +bmi.value || 30);
+      var seq = [1, 2, 3, 5, 10, 20].map(function (n) {
+        return Math.ceil(f + (m - f) * (n - 1) / (n - 1 + 4));
+      });
+      bprev.textContent = 'Reviews 1, 2, 3, 5, 10, 20: ' + seq.join(', ') + ' days';
+    }
+    bfi.oninput = preview; bmi.oninput = preview;
+    preview();
+    betaBox.appendChild(bprev);
+    wrap.appendChild(betaBox);
+    scHint();
+
     wrap.appendChild(el('label', '', 'Longest interval, in days'));
     var mx = document.createElement('input');
     mx.type = 'number'; mx.value = S.cfg.maxInterval || 180; mx.min = 14; mx.max = 3650;
@@ -1648,6 +1877,9 @@ function settingsSheet() {
       S.cfg.defaultPriority = dpv.v;
       S.cfg.overload = Math.max(10, Math.min(200, +ov.value || 40));
       S.cfg.maxInterval = Math.max(14, Math.min(3650, +mx.value || 180));
+      S.cfg.scheduler = scv.v;
+      S.cfg.betaFirst = Math.max(1, Math.min(60, +bfi.value || 5));
+      S.cfg.betaMax = Math.max(S.cfg.betaFirst, Math.min(365, +bmi.value || 30));
       S.cfg.ghRepo = repo.value.trim();
       S.cfg.ghToken = tok.value.trim();
       saveCfg();
@@ -1955,20 +2187,24 @@ function archiveScreen() {
     c.appendChild(r);
     var pct = s.blocks.length ? Math.round(s.position / s.blocks.length * 100) : 0;
     var n = S.items.filter(function (i) { return i.sourceId === s.id; }).length;
-    var m = el('p', 'ghost', (s.author ? s.author + ' · ' : '') + pct + '% · ' + plural(n, 'item'));
+    var m = el('p', 'ghost', isColl(s) ? 'collection · ' + plural(n, 'item')
+      : (s.author ? s.author + ' · ' : '') + pct + '% · ' + plural(n, 'item'));
     m.style.margin = '6px 0 10px';
     c.appendChild(m);
     var row = el('div', 'chips');
     var t = el('button', '', s.archived ? 'Reactivate' : 'Archive');
     t.onclick = function () {
-      var active = S.sources.filter(function (x) { return !x.archived; }).length;
-      if (s.archived && active >= SHELF_MAX) return toast('Shelf is full. Archive one first.');
+      var active = activeBooks().length;
+      if (s.archived && !isColl(s) && active >= SHELF_MAX) return toast('Shelf is full. Archive one first.');
       s.archived = !s.archived;
       save(s);
       archiveScreen();
     };
     var o = el('button', '', 'Open');
-    o.onclick = function () { openReader(s); };
+    o.onclick = function () {
+      if (isColl(s)) { BR.q = ''; BR.book = s.id; BR.filter = 'open'; clearSel(); return browseScreen(); }
+      openReader(s);
+    };
     var d = el('button', '', 'Delete');
     d.style.color = 'var(--red)';
     d.onclick = function () {
@@ -1986,9 +2222,206 @@ function archiveScreen() {
   });
 }
 
+/* ---------- clipping ----------
+   For reading done outside the app: web articles, PDFs, anything you can
+   select. A collection is a parent with no text of its own, just a home
+   for extracts. Clips land as ordinary extracts, so they shorten, split,
+   take notes and become cards exactly like book extracts. */
+function makeCollection(name) {
+  var c = {
+    id: uid(), kind: 'source', type: 'collection', title: name, author: '',
+    blocks: [], toc: [], position: 0, priority: 3, rank: 0.5,
+    interval: 0, dueAt: Date.now(), reps: 0,
+    archived: false, addedAt: Date.now(), createdAt: Date.now(), finishedAt: null
+  };
+  S.sources.push(c);
+  put('sources', c);
+  return c;
+}
+function collections() {
+  return S.sources.filter(function (s) { return isColl(s) && !s.archived; });
+}
+
+/* Chrome shares a text selection as the quoted text followed by a link to
+   the exact passage. Pull the link out and strip the quotes. */
+function parseShare(p) {
+  var text = (p.text || '').trim();
+  var url = (p.url || '').trim();
+  var m = text.match(/\s*(https?:\/\/\S+)\s*$/);
+  if (m) {
+    if (!url) url = m[1];
+    text = text.slice(0, m.index).trim();
+  }
+  text = text.replace(/^["\u201c]([\s\S]*)["\u201d]$/, '$1').trim();
+  return { text: text, url: url, title: (p.title || '').trim() };
+}
+
+/* Split pasted text into passages: blank lines or Kindle's ==========
+   separators. Drop the metadata lines Kindle exports put above each
+   highlight, so only the words you marked survive. */
+var META = /^(your\s+)?(highlight|note|bookmark)\b.*(location|page|loc\.|added on|\|)/i;
+function passages(text) {
+  return String(text || '')
+    .split(/\n\s*\n|\n?={5,}\n?/)
+    .map(function (p) {
+      return p.split('\n').filter(function (l) { return !META.test(l.trim()); })
+        .join(' ').replace(/\s+/g, ' ').trim();
+    })
+    .filter(function (p) { return p.length > 1; });
+}
+
+function takeShare() {
+  var q = new URLSearchParams(location.search);
+  if (!q.has('text') && !q.has('url') && !q.has('title')) return;
+  history.replaceState(null, '', location.pathname);
+  clipSheet(parseShare({ text: q.get('text'), url: q.get('url'), title: q.get('title') }));
+}
+
+function clipSheet(pre) {
+  sheet(function (w) {
+    w.appendChild(el('h2', '', 'Clip'));
+    var hint = el('p', 'ghost', pre.url ? pre.url.replace(/^https?:\/\//, '').split(/[?#]/)[0]
+      : 'Paste a passage. It becomes an extract like any other.');
+    hint.style.cssText = 'margin:6px 0 12px;word-break:break-all';
+    w.appendChild(hint);
+    var ta = document.createElement('textarea');
+    ta.rows = 7;
+    ta.value = pre.text || '';
+    ta.placeholder = 'The passage worth keeping';
+    w.appendChild(ta);
+
+    var tools = el('div', 'row');
+    tools.style.marginTop = '6px';
+    var found = el('span', 'ghost', '');
+    tools.appendChild(found);
+    var pb = el('button', 'plain', 'Paste');
+    pb.onclick = function () {
+      if (!navigator.clipboard || !navigator.clipboard.readText) {
+        return toast('Long-press the box and paste instead');
+      }
+      navigator.clipboard.readText().then(function (t) {
+        if (!t || !t.trim()) return toast('Clipboard is empty');
+        ta.value = ta.value.trim() ? ta.value.replace(/\s+$/, '') + '\n\n' + t : t;
+        onText();
+      }).catch(function () { toast('Long-press the box and paste instead'); });
+    };
+    tools.appendChild(pb);
+    w.appendChild(tools);
+
+    /* Several passages separated by blank lines can come in as one extract
+       each. Splitting is the default once there is more than one. */
+    var split = { on: true };
+    var mode = el('div', 'chips');
+    mode.style.marginTop = '8px';
+    var mOne = el('button', '', 'One extract');
+    var mMany = el('button', 'sel', '');
+    mOne.onclick = function () { split.on = false; onText(); };
+    mMany.onclick = function () { split.on = true; onText(); };
+    mode.appendChild(mOne);
+    mode.appendChild(mMany);
+    w.appendChild(mode);
+    function onText() {
+      var n = passages(ta.value).length;
+      mode.style.display = n > 1 ? '' : 'none';
+      found.textContent = n > 1 ? plural(n, 'passage') + ' found' : '';
+      mMany.textContent = n + ' extracts';
+      mOne.className = split.on ? '' : 'sel';
+      mMany.className = split.on ? 'sel' : '';
+      ok.textContent = n > 1 && split.on ? 'Save ' + n + ' clips' : 'Save clip';
+    }
+    ta.oninput = onText;
+
+    var l1 = el('label', '', 'Into');
+    l1.style.marginTop = '12px';
+    w.appendChild(l1);
+    var sel = document.createElement('select');
+    var cols = collections();
+    cols.forEach(function (c) {
+      var o = document.createElement('option');
+      o.value = c.id; o.textContent = c.title;
+      if (c.id === S.cfg.lastCollection) o.selected = true;
+      sel.appendChild(o);
+    });
+    var onew = document.createElement('option');
+    onew.value = '__new'; onew.textContent = '+ New collection';
+    sel.appendChild(onew);
+    if (!cols.length) sel.value = '__new';
+    w.appendChild(sel);
+    var nm = document.createElement('input');
+    nm.placeholder = 'Name, e.g. Web clippings';
+    nm.value = cols.length ? '' : 'Web clippings';
+    nm.style.marginTop = '8px';
+    w.appendChild(nm);
+    function showName() { nm.style.display = sel.value === '__new' ? '' : 'none'; }
+    sel.onchange = showName;
+    showName();
+
+    var l2 = el('label', '', 'Priority');
+    l2.style.marginTop = '12px';
+    w.appendChild(l2);
+    var pv = { v: S.cfg.defaultPriority || 4 };
+    var chips = el('div', 'chips');
+    [1, 2, 3, 4, 5].forEach(function (p) {
+      var b = el('button', p === pv.v ? 'sel' : '', String(p));
+      b.onclick = function () {
+        pv.v = p;
+        Array.prototype.slice.call(chips.children).forEach(function (x, i) {
+          x.className = i + 1 === p ? 'sel' : '';
+        });
+      };
+      chips.appendChild(b);
+    });
+    w.appendChild(chips);
+
+    var row = el('div', 'chips');
+    row.style.marginTop = '16px';
+    var cancel = el('button', '', 'Cancel');
+    cancel.onclick = closeSheet;
+    var ok = el('button', 'solid', 'Save clip');
+    ok.onclick = function () {
+      var list = passages(ta.value);
+      if (!list.length) return toast('Nothing to save');
+      if (!split.on || list.length === 1) list = [list.join(' ')];
+      var col;
+      if (sel.value === '__new') {
+        var name = nm.value.trim();
+        if (!name) return toast('Name the collection');
+        col = makeCollection(name);
+      } else {
+        col = S.sources.filter(function (s) { return s.id === sel.value; })[0];
+      }
+      /* Each item is placed in the chosen band, then the batch's ranks are
+         handed back out in reading order, so the first passage comes up
+         first. A big batch is spread eight per day so a finished book does
+         not land as one wall. */
+      var made = list.map(function (t, i) {
+        var it = makeItem('extract', t, col, null, null, null);
+        if (pre.url) it.url = pre.url;
+        if (pre.title) it.pageTitle = pre.title;
+        it.dueAt += Math.floor(i / 8) * DAY;
+        place(it, pv.v);
+        return it;
+      });
+      var ranks = made.map(function (it) { return it.rank; }).sort(function (a, b) { return a - b; });
+      made.forEach(function (it, i) { it.rank = ranks[i]; save(it); });
+      S.cfg.lastCollection = col.id;
+      saveCfg();
+      closeSheet();
+      if (S.view === 's-home') home();
+      toast(list.length > 1 ? plural(list.length, 'clip') + ' saved to ' + col.title
+        : 'Clipped to ' + col.title);
+    };
+    row.appendChild(cancel);
+    row.appendChild(ok);
+    w.appendChild(row);
+    onText();
+    if (!ta.value) setTimeout(function () { ta.focus(); }, 60);
+  });
+}
+
 /* ---------- wiring ---------- */
 $('btn-add').onclick = function () {
-  var active = S.sources.filter(function (s) { return !s.archived; }).length;
+  var active = activeBooks().length;
   if (active >= SHELF_MAX) return toast('Shelf is full at ' + SHELF_MAX + '. Archive one first.');
   $('file').click();
 };
@@ -1997,6 +2430,7 @@ $('file').onchange = function () {
   this.value = '';
 };
 $('btn-export').onclick = exportSheet;
+$('btn-clip').onclick = function () { clipSheet({}); };
 $('btn-settings').onclick = settingsSheet;
 $('btn-archive').onclick = archiveScreen;
 $('btn-browse').onclick = function () { BR.q = ''; clearSel(); browseScreen(); };
@@ -2062,6 +2496,7 @@ open().then(function () {
   migrateRanks();
   var moved = autoPostpone();
   home();
+  takeShare();
   if (moved) toast(plural(moved, 'item') + ' postponed to keep today manageable');
   if (navigator.storage && navigator.storage.persist) {
     navigator.storage.persist().then(function (ok) { S.cfg.persisted = ok; saveCfg(); });

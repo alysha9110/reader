@@ -64,6 +64,10 @@ label{font-size:12px;color:var(--ink-faint);display:block;margin-bottom:6px}
 .next .meta{color:var(--ink-ghost);font-size:11px}
 .next button{background:var(--paper);color:var(--ink);border-color:var(--paper);width:100%}
 
+.shieldrow{margin:-8px 0 22px;cursor:pointer;padding:4px 0}
+.shieldbar{height:4px;border-radius:2px;overflow:hidden}
+.shieldbar>i{height:4px;background:var(--green)}
+.srclink{display:block;text-align:center;text-decoration:none;color:var(--ink-faint);font-size:12px;padding:8px 4px;margin-top:8px}
 .shelfitem{border-top:.5px solid var(--rule);padding:12px 0;cursor:pointer}
 
 #page{padding:18px}
@@ -130,10 +134,12 @@ mark{background:var(--amber-bg);color:var(--amber-ink);border-radius:3px;padding
 <div id="s-home" class="screen on pad">
   <div class="row"><h1 id="today">Today</h1><span class="muted" id="duecount"></span></div>
   <div class="next gap" id="nextcard"></div>
+  <div class="shieldrow" id="shieldrow"></div>
   <div class="row"><span class="eyebrow">Reading now</span><span class="ghost" id="shelfcount"></span></div>
   <div id="shelf"></div>
   <div class="rule gap" style="padding-top:14px;display:flex;justify-content:space-between;flex-wrap:wrap;gap:4px">
     <button class="plain" id="btn-add">+ Book</button>
+    <button class="plain" id="btn-clip">+ Clip</button>
     <button class="plain" id="btn-browse">Extracts</button>
     <button class="plain" id="btn-archive">Books</button>
     <button class="plain" id="btn-reading">Reading</button>
